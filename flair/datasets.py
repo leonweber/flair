@@ -27,6 +27,7 @@ from flair.data import (
     segtok_tokenizer,
 )
 from flair.file_utils import cached_path, unzip_file
+from flair import bio_utils
 
 log = logging.getLogger("flair")
 
@@ -3498,6 +3499,50 @@ class WNUT_17(ColumnCorpus):
         )
 
 
+class BioInfer(ColumnCorpus):
+    def __init__(
+            self,
+            base_path: Union[str, Path] = None,
+            tag_to_bioes: str = "ner",
+            in_memory: bool = True
+    ):
+        if type(base_path) == str:
+            base_path: Path = Path(base_path)
+
+        # column format
+        columns = {0:  "text", 1: "ner"}
+
+        # this dataset name
+        dataset_name = self.__class__.__name__.lower()
+
+        # default dataset folder is the cache root
+        if not base_path:
+            base_path = Path(flair.cache_root) / "datasets"
+        data_folder = base_path / dataset_name
+
+        # download data if necessary
+        data_url = "http://mars.cs.utu.fi/BioInfer/files/BioInfer_corpus_1.1.1.zip"
+
+        train_file = data_folder / 'train.conll'
+        dev_file = data_folder / 'dev.conll'
+        test_file = data_folder / 'test.conll'
+
+        split_dir = Path(__file__).parent.parent / 'resources' / 'splits'
+        writer = bio_utils.CoNLLWriter(split_dir/'bioinfer')
+
+        if not (train_file.exists() and dev_file.exists() and test_file.exists()):
+            path = cached_path(data_url, data_folder)
+            unzip_file(
+                path, data_folder
+            )
+            dataset = bio_utils.bioinfer_to_internal(data_folder / "BioInfer_corpus_1.1.1.xml")
+            writer.process_dataset(dataset, data_folder)
+
+        super(BioInfer, self).__init__(
+            data_folder, columns, tag_to_bioes=tag_to_bioes, in_memory=in_memory
+        )
+
+
 class DataLoader(torch.utils.data.dataloader.DataLoader):
     def __init__(
             self,
@@ -3586,3 +3631,4 @@ def find_train_dev_test_files(data_folder, dev_file, test_file, train_file):
     log.info("Test: {}".format(test_file))
 
     return dev_file, test_file, train_file
+
