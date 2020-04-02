@@ -2,11 +2,12 @@ import os
 from collections import namedtuple, defaultdict
 from itertools import combinations
 from pathlib import Path
-from typing import Union, Callable, Optional, Dict
+from typing import Union, Callable, Optional, Dict, List, Tuple
 import shutil
 from abc import ABC, abstractmethod
 
 from lxml import etree
+import segtok
 
 import flair
 from flair.datasets import ColumnCorpus
@@ -38,28 +39,16 @@ def merge_overlapping_entities(entities):
     return entities
 
 
-def compute_token_char_offsets(tokens, sentence):
-    start_idx = 0
-    end_idx = 0
-
-    indices = []
-    for token in tokens:
-        start_idx = end_idx
-        while not sentence[start_idx].strip():
-            start_idx += 1
-        end_idx = start_idx + len(token)
-
-        assert token == sentence[start_idx:end_idx]
-
-        indices.append((start_idx, end_idx))
-
-    return indices
 
 
 class CoNLLWriter:
 
-    def __init__(self, split_path=None):
-        self.split_path: Optional[Path] = split_path
+    def __init__(self, tokenizer: Callable[[str], Tuple[List[str], List[int]]],
+                 sentence_splitter: Callable[[str], Tuple[List[str], List[int]]],
+                 split_path: Path):
+        self.tokenizer = tokenizer
+        self.sentence_splitter = sentence_splitter
+        self.split_path = split_path
 
     def process_dataset(self, datasets: Dict[str, InternalHUNERDataset], out_dir: Path):
         train_dataset, dev_dataset, test_dataset = self.split_dataset(datasets['all'])
@@ -82,31 +71,30 @@ class CoNLLWriter:
             for document_id in dataset.documents.keys():
 
                 document_text = dataset.documents[document_id]
-                tokens = document_text.split()
+                sentences, sentence_offsets = self.sentence_splitter(document_text)
                 entities = [range(*e) for e in
                             dataset.entities_per_document[document_id]]
-                in_entity = False
 
-                token_char_offsets = compute_token_char_offsets(
-                    [token for token in tokens],
-                    document_text)
+                for sentence, sentence_offset in zip(sentences, sentence_offsets):
+                    in_entity = False
+                    tokens, token_offsets = self.tokenizer(sentence)
+                    for token, token_offset in zip(tokens, token_offsets):
+                        offset = sentence_offset + token_offset
 
-                for (start_idx, end_idx), token in zip(token_char_offsets, tokens):
+                        for entity in entities:
+                            if offset in entity:
+                                if in_entity != entity:
+                                    tag = 'B-Ent'
+                                    in_entity = entity
+                                else:
+                                    tag = 'I-Ent'
+                                break
+                        else:
+                            tag = 'O'
+                            in_entity = False
 
-                    for entity in entities:
-                        if start_idx in entity:
-                            if in_entity != entity:
-                                tag = 'B-Ent'
-                                in_entity = entity
-                            else:
-                                tag = 'I-Ent'
-                            break
-                    else:
-                        tag = 'O'
-                        in_entity = False
-
-                    f.write(' '.join([token, tag]) + '\n')
-                f.write('\n')
+                        f.write(' '.join([token, tag]) + '\n')
+                    f.write('\n')
 
     def split_dataset(self, dataset: InternalHUNERDataset):
         with self.split_path.with_suffix('.train').open() as f:
@@ -136,6 +124,33 @@ class CoNLLWriter:
                                    test_ids})
 
         return train_dataset, dev_dataset, test_dataset
+
+
+class SciSpacyTokenizer:
+    def __init__(self):
+        import spacy
+        self.nlp = spacy.load('en_core_sci_sm', disable=['tagger', 'ner', 'parser',
+                                                         'textcat'])
+
+    def __call__(self, sentence: str):
+        sentence = self.nlp(sentence)
+        tokens = [str(tok) for tok in sentence]
+        offsets = [tok.idx for tok in sentence]
+
+        return tokens, offsets
+
+
+class SciSpacySentenceSplitter:
+    def __init__(self):
+        import spacy
+        self.nlp = spacy.load('en_core_sci_sm', disable=['tagger', 'ner', 'textcat'])
+
+    def __call__(self, text: str):
+        doc = self.nlp(text)
+        sentences = [str(sent) for sent in doc.sents]
+        offsets = [sent.start_char for sent in doc.sents]
+
+        return sentences, offsets
 
 
 class HUNERDataset(ColumnCorpus, ABC):
@@ -170,8 +185,38 @@ class HUNERDataset(ColumnCorpus, ABC):
             use_huner_split: bool = False,
             base_path: Union[str, Path] = None,
             tag_to_bioes: str = "ner",
-            in_memory: bool = True
+            in_memory: bool = True,
+            tokenizer: Callable[[str], Tuple[List[str], List[int]]] = None,
+            sentence_splitter: Callable[[str], Tuple[List[str], List[int]]] = None
     ):
+        """
+        tokenizer: Takes string and returns tokens + offsets
+        sentence_splitter: Takes string and returns sentences + offsets
+        """
+
+        if tokenizer is None:
+            try:
+                import spacy
+                tokenizer = SciSpacyTokenizer()
+            except ImportError:
+                raise ValueError("Default tokenizer is scispacy."
+                                 "Install packages 'scispacy' and"
+                                 "'https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy"
+                                 "/releases/v0.2.4/en_core_sci_sm-0.2.4.tar.gz' via pip"
+                                 "or choose a different tokenizer")
+
+        if sentence_splitter is None:
+            try:
+                import spacy
+                sentence_splitter = SciSpacySentenceSplitter()
+            except ImportError:
+                raise ValueError("Default sentence splitter is scispacy."
+                                 "Install packages 'scispacy' and"
+                                 "'https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy"
+                                 "/releases/v0.2.4/en_core_sci_sm-0.2.4.tar.gz' via pip"
+                                 "or choose a different sentence splitter")
+
+
         if type(base_path) == str:
             base_path: Path = Path(base_path)
 
@@ -203,7 +248,9 @@ class HUNERDataset(ColumnCorpus, ABC):
             cached_path(self.split_url + '.train', data_folder / 'split')
             cached_path(self.split_url + '.dev', data_folder / 'split')
             cached_path(self.split_url + '.test', data_folder / 'split')
-            writer = CoNLLWriter(data_folder / 'split' / split_name)
+            writer = CoNLLWriter(tokenizer=tokenizer,
+                                 sentence_splitter=sentence_splitter,
+                                 split_path=data_folder / 'split' / split_name)
             internal_datasets = self.to_internal(data_folder)
             writer.process_dataset(internal_datasets, data_folder)
 
@@ -259,8 +306,14 @@ class BioInfer(HUNERDataset):
                 token_text = ''.join(token.xpath('.//subtoken/@text'))
                 token_id = '.'.join(token.attrib['id'].split('.')[1:])
                 token_ids.append(token_id)
-                token_offsets.append(len(sentence_text) + 1)
-                sentence_text += ' ' + token_text
+
+                if not sentence_text:
+                    token_offsets.append(0)
+                    sentence_text = token_text
+                else:
+                    token_offsets.append(len(sentence_text) + 1)
+                    sentence_text += ' ' + token_text
+
 
             documents[sentence_id] = sentence_text
 
